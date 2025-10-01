@@ -311,3 +311,237 @@ func RandomIV() []byte {
 	}
 	return iv
 }
+
+// GCM implementation
+
+// incCounter increments a 128-bit counter (used in CTR mode)
+func incCounter(counter []byte) {
+	for i := len(counter) - 1; i >= 0; i-- {
+		counter[i]++
+		if counter[i] != 0 {
+			break
+		}
+	}
+}
+
+// CTREncrypt performs CTR mode encryption/decryption (it's symmetric)
+func CTREncrypt(data, key, iv []byte) ([]byte, error) {
+	if len(key) != 16 {
+		return nil, fmt.Errorf("AES-128 requires a 16-byte key")
+	}
+	if len(iv) != 16 {
+		return nil, fmt.Errorf("CTR mode requires 16-byte IV/counter")
+	}
+	
+	out := make([]byte, len(data))
+	counter := make([]byte, 16)
+	copy(counter, iv)
+	
+	for i := 0; i < len(data); i += 16 {
+		keyStream := EncryptBlock(counter, key)
+		blockSize := 16
+		if i+blockSize > len(data) {
+			blockSize = len(data) - i
+		}
+		for j := 0; j < blockSize; j++ {
+			out[i+j] = data[i+j] ^ keyStream[j]
+		}
+		incCounter(counter)
+	}
+	return out, nil
+}
+
+// gfMul multiplies two elements in GF(2^128) used in GHASH
+func gfMul(x, y []byte) []byte {
+	result := make([]byte, 16)
+	v := make([]byte, 16)
+	copy(v, y)
+	
+	for i := 0; i < 128; i++ {
+		byteIdx := i / 8
+		bitIdx := 7 - (i % 8)
+		if (x[byteIdx] & (1 << bitIdx)) != 0 {
+			for j := 0; j < 16; j++ {
+				result[j] ^= v[j]
+			}
+		}
+		
+		// Check if LSB is set
+		lsb := v[15] & 1
+		// Right shift v by 1
+		for j := 15; j > 0; j-- {
+			v[j] = (v[j] >> 1) | ((v[j-1] & 1) << 7)
+		}
+		v[0] >>= 1
+		
+		// If LSB was set, XOR with R = 0xE1000000000000000000000000000000
+		if lsb != 0 {
+			v[0] ^= 0xE1
+		}
+	}
+	return result
+}
+
+// ghash computes GHASH authentication tag
+func ghash(h, aad, ciphertext []byte) []byte {
+	// Initialize tag
+	tag := make([]byte, 16)
+	
+	// Process AAD
+	aadLen := len(aad)
+	for i := 0; i < aadLen; i += 16 {
+		block := make([]byte, 16)
+		copy(block, aad[i:min(i+16, aadLen)])
+		for j := 0; j < 16; j++ {
+			tag[j] ^= block[j]
+		}
+		tag = gfMul(tag, h)
+	}
+	
+	// Process ciphertext
+	ctLen := len(ciphertext)
+	for i := 0; i < ctLen; i += 16 {
+		block := make([]byte, 16)
+		copy(block, ciphertext[i:min(i+16, ctLen)])
+		for j := 0; j < 16; j++ {
+			tag[j] ^= block[j]
+		}
+		tag = gfMul(tag, h)
+	}
+	
+	// Process lengths
+	lenBlock := make([]byte, 16)
+	// AAD length in bits (big-endian)
+	aadBits := uint64(aadLen * 8)
+	ctBits := uint64(ctLen * 8)
+	for i := 0; i < 8; i++ {
+		lenBlock[7-i] = byte(aadBits >> (i * 8))
+		lenBlock[15-i] = byte(ctBits >> (i * 8))
+	}
+	for j := 0; j < 16; j++ {
+		tag[j] ^= lenBlock[j]
+	}
+	tag = gfMul(tag, h)
+	
+	return tag
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// GCMEncrypt encrypts data using AES-GCM mode
+// Returns: ciphertext || tag (16 bytes)
+func GCMEncrypt(plaintext, key, nonce, aad []byte) ([]byte, error) {
+	if len(key) != 16 {
+		return nil, fmt.Errorf("AES-128 requires a 16-byte key")
+	}
+	if len(nonce) != 12 {
+		return nil, fmt.Errorf("GCM requires a 12-byte nonce")
+	}
+	
+	// Generate H = E(K, 0^128)
+	h := EncryptBlock(make([]byte, 16), key)
+	
+	// Prepare counter for CTR mode
+	// GCM uses: nonce || 0^31 || 1
+	counter := make([]byte, 16)
+	copy(counter, nonce)
+	counter[15] = 1
+	
+	// Prepare initial counter for tag generation
+	j0 := make([]byte, 16)
+	copy(j0, nonce)
+	// j0 ends with 0x00000001
+	
+	// Increment counter for encryption
+	incCounter(counter)
+	
+	// Encrypt plaintext using CTR mode
+	ciphertext, err := CTREncrypt(plaintext, key, counter)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Calculate GHASH
+	tag := ghash(h, aad, ciphertext)
+	
+	// Encrypt tag with j0
+	j0[15] = 1
+	encJ0 := EncryptBlock(j0, key)
+	for i := 0; i < 16; i++ {
+		tag[i] ^= encJ0[i]
+	}
+	
+	// Append tag to ciphertext
+	result := append(ciphertext, tag...)
+	return result, nil
+}
+
+// GCMDecrypt decrypts data using AES-GCM mode and verifies the tag
+func GCMDecrypt(ciphertextWithTag, key, nonce, aad []byte) ([]byte, error) {
+	if len(key) != 16 {
+		return nil, fmt.Errorf("AES-128 requires a 16-byte key")
+	}
+	if len(nonce) != 12 {
+		return nil, fmt.Errorf("GCM requires a 12-byte nonce")
+	}
+	if len(ciphertextWithTag) < 16 {
+		return nil, fmt.Errorf("ciphertext too short (must include 16-byte tag)")
+	}
+	
+	// Split ciphertext and tag
+	tagStart := len(ciphertextWithTag) - 16
+	ciphertext := ciphertextWithTag[:tagStart]
+	receivedTag := ciphertextWithTag[tagStart:]
+	
+	// Generate H = E(K, 0^128)
+	h := EncryptBlock(make([]byte, 16), key)
+	
+	// Calculate expected tag
+	expectedTag := ghash(h, aad, ciphertext)
+	
+	// Encrypt tag with j0
+	j0 := make([]byte, 16)
+	copy(j0, nonce)
+	j0[15] = 1
+	encJ0 := EncryptBlock(j0, key)
+	for i := 0; i < 16; i++ {
+		expectedTag[i] ^= encJ0[i]
+	}
+	
+	// Constant-time comparison of tags
+	var tagMatch byte = 0
+	for i := 0; i < 16; i++ {
+		tagMatch |= receivedTag[i] ^ expectedTag[i]
+	}
+	if tagMatch != 0 {
+		return nil, fmt.Errorf("authentication failed: tag mismatch")
+	}
+	
+	// Decrypt ciphertext using CTR mode
+	counter := make([]byte, 16)
+	copy(counter, nonce)
+	counter[15] = 1
+	incCounter(counter)
+	
+	plaintext, err := CTREncrypt(ciphertext, key, counter)
+	if err != nil {
+		return nil, err
+	}
+	
+	return plaintext, nil
+}
+
+// RandomNonce generates a random 12-byte nonce for GCM
+func RandomNonce() []byte {
+	nonce := make([]byte, 12)
+	_, err := rand.Read(nonce)
+	if err != nil {
+		panic(err)
+	}
+	return nonce
+}
