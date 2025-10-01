@@ -1,0 +1,11 @@
+# Binaries
+aes-cli
+*.exe
+*.out
+
+# Test files
+*.enc
+*.dec.txt
+
+# Go specific
+go.sum
